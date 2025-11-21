@@ -1,48 +1,74 @@
 const express = require('express');
 const cors = require('cors');
-const app = express();
+const { Pool } = require('pg');
+require('dotenv').config();
 
+const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Base de datos temporal (en memoria)
-let mensajes = [];
-
-// Ruta POST Webhook
-app.post('/webhook/whatsapp', (req, res) => {
-  console.log('Body recibido:', req.body);
-
-  // Guardar mensaje en la "DB"
-  mensajes.push({
-    id: Date.now(),
-    from: req.body.from || "",
-    message: req.body.message || "",
-    full: req.body
-  });
-
-  res.status(200).json({
-    status: 'ok',
-    message: 'Webhook recibido y guardado correctamente',
-    data: req.body
-  });
+// ---------- CONEXIÓN A POSTGRES ----------
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
-// Ruta GET para ver mensajes guardados
-app.get('/messages', (req, res) => {
-  res.json({
-    status: "ok",
-    total: mensajes.length,
-    data: mensajes
-  });
+// Crear tabla si no existe
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        phone VARCHAR(30),
+        message TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    console.log('Tabla messages lista');
+  } catch (err) {
+    console.error('Error creando tabla:', err);
+  }
+})();
+
+// ---------- RUTA WEBHOOK DESDE N8N ----------
+app.post('/webhook/whatsapp', async (req, res) => {
+  const { phone, message } = req.body;
+
+  try {
+    await pool.query(
+      'INSERT INTO messages (phone, message) VALUES ($1, $2)',
+      [phone, message]
+    );
+
+    res.json({
+      status: 'ok',
+      message: 'Guardado en base de datos',
+      data: req.body,
+    });
+  } catch (err) {
+    console.error('Error guardando mensaje:', err);
+    res.status(500).json({ error: 'Error guardando mensaje' });
+  }
 });
 
-// Puerto Render
-const PORT = process.env.PORT || 10000;
+// ---------- LISTAR MENSAJES ----------
+app.get('/messages', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM messages ORDER BY id DESC'
+    );
 
-app.listen(PORT, () => {
-  console.log(`Servidor corriendo en http://localhost:${PORT}`);
+    res.json({
+      status: 'ok',
+      total: result.rowCount,
+      data: result.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Error consultando mensajes' });
+  }
 });
-// ---------- LISTAR CONVERSACIONES (agrupadas por phone) ----------
+
+// ---------- LISTAR CONVERSACIONES ----------
 app.get('/conversations', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -50,7 +76,6 @@ app.get('/conversations', async (req, res) => {
         m.phone,
         MAX(m.created_at) AS last_message_at,
         COUNT(*) AS total_messages,
-        -- último mensaje de ese teléfono
         (
           SELECT m2.message
           FROM messages m2
@@ -63,14 +88,13 @@ app.get('/conversations', async (req, res) => {
       ORDER BY last_message_at DESC;
     `);
 
-    // Aquí podrías meter lógica de estado (NUEVO, AGENTE, RESUELTO) más adelante
     const conversations = result.rows.map(row => ({
       phone: row.phone,
       lastMessage: row.last_message,
       lastMessageAt: row.last_message_at,
       totalMessages: row.total_messages,
-      status: 'NUEVO',      // por ahora hardcodeado
-      tags: [],             // luego puedes llenar esto
+      status: 'NUEVO',
+      tags: [],
     }));
 
     res.json({
@@ -79,13 +103,11 @@ app.get('/conversations', async (req, res) => {
       data: conversations,
     });
   } catch (err) {
-    console.error('❌ Error al consultar conversaciones:', err);
-    res.status(500).json({
-      status: 'error',
-      message: 'Error al consultar conversaciones',
-    });
+    console.error('Error en /conversations', err);
+    res.status(500).json({ error: 'Error consultando conversaciones' });
   }
 });
 
-
-
+// ---------- INICIO SERVIDOR ----------
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Servidor corriendo en puerto ${PORT}`));
